@@ -272,7 +272,7 @@ resource "aws_ecs_cluster" "main" {
 resource "aws_ecs_task_definition" "backend" {
   family                   = "devops-backend"
   network_mode             = "awsvpc"
-  requires_compatibility   = ["FARGATE"]
+  requires_compatibilities = ["FARGATE"]
   cpu                      = "256"
   memory                   = "512"
   execution_role_arn       = aws_iam_role.ecs_execution_role.arn
@@ -307,7 +307,7 @@ resource "aws_ecs_task_definition" "backend" {
 resource "aws_ecs_task_definition" "frontend" {
   family                   = "devops-frontend"
   network_mode             = "awsvpc"
-  requires_compatibility   = ["FARGATE"]
+  requires_compatibilities = ["FARGATE"]
   cpu                      = "256"
   memory                   = "512"
   execution_role_arn       = aws_iam_role.ecs_execution_role.arn
