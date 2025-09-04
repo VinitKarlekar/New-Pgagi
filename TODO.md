@@ -1,7 +1,7 @@
-# TODO: Fix Terraform and CI/CD for DevOps Setup
+# TODO: Fix Frontend-Backend Connection Issue
 
 ## Tasks
-- [ ] Update terraform/main.tf to change resource names (append -v2) for ECR, log groups, IAM roles, secrets, ALB, target groups, cluster, security groups, subnets, etc.
-- [ ] Update .github/workflows/deploy.yml to use new resource names
-- [ ] Test terraform plan and apply
-- [ ] Test CI/CD pipeline
+- [ ] Set GitHub repository variable LOAD_BALANCER_DNS to 'devops-alb-31375625.us-east-1.elb.amazonaws.com'
+- [ ] Re-run GitHub Actions workflow to rebuild and redeploy frontend with correct NEXT_PUBLIC_API_URL
+- [ ] Verify frontend can connect to backend after redeployment
+- [ ] Test the full application flow
