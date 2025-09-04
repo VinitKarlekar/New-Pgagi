@@ -1,5 +1,4 @@
-# frontend/Dockerfile
-# Multi-stage build
+
 FROM node:18-slim AS deps
 WORKDIR /app
 COPY package*.json ./
