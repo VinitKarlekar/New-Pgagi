@@ -477,7 +477,8 @@ resource "aws_iam_role_policy" "ecs_task_policy" {
 
 # Secrets Manager
 resource "aws_secretsmanager_secret" "app_secrets" {
-  name = "devops/app-secrets"
+  name                    = "devops/app-secrets-v2"
+  recovery_window_in_days = 7
 }
 
 resource "aws_secretsmanager_secret_version" "app_secrets" {
