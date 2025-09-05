@@ -11,45 +11,40 @@ provider "aws" {
   region = var.aws_region
 }
 
-# VPC Configuration
-resource "aws_vpc" "main" {
-  cidr_block           = "10.0.0.0/16"
-  enable_dns_hostnames = true
-  enable_dns_support   = true
-  
-  tags = {
-    Name = "devops-vpc"
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# VPC Configuration (using default VPC for simplicity)
+data "aws_vpc" "main" {
+  default = true
+}
+
+data "aws_internet_gateway" "main" {
+  filter {
+    name   = "attachment.vpc-id"
+    values = [data.aws_vpc.main.id]
   }
 }
 
-# Internet Gateway
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-  
-  tags = {
-    Name = "devops-igw"
+# Get default subnets
+data "aws_subnets" "public" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.main.id]
+  }
+  filter {
+    name   = "default-for-az"
+    values = ["true"]
   }
 }
 
-# Public Subnets
-resource "aws_subnet" "public" {
-  count             = 2
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.${count.index + 1}.0/24"
-  availability_zone = data.aws_availability_zones.available.names[count.index]
-  
-  map_public_ip_on_launch = true
-  
-  tags = {
-    Name = "devops-public-subnet-${count.index + 1}"
-  }
-}
-
-# Private Subnets
+# Create private subnets
 resource "aws_subnet" "private" {
   count             = 2
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = "10.0.${count.index + 10}.0/24"
+  vpc_id            = data.aws_vpc.main.id
+  cidr_block        = "172.31.${count.index + 100}.0/24"
   availability_zone = data.aws_availability_zones.available.names[count.index]
   
   tags = {
@@ -57,27 +52,7 @@ resource "aws_subnet" "private" {
   }
 }
 
-# Route Table for Public Subnets
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-  
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-  
-  tags = {
-    Name = "devops-public-rt"
-  }
-}
-
-resource "aws_route_table_association" "public" {
-  count          = 2
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
-}
-
-# NAT Gateway
+# NAT Gateway for private subnets
 resource "aws_eip" "nat" {
   domain = "vpc"
   
@@ -88,16 +63,16 @@ resource "aws_eip" "nat" {
 
 resource "aws_nat_gateway" "main" {
   allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public[0].id
+  subnet_id     = tolist(data.aws_subnets.public.ids)[0]
   
   tags = {
     Name = "devops-nat"
   }
 }
 
-# Route Table for Private Subnets
+# Route table for private subnets
 resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
+  vpc_id = data.aws_vpc.main.id
   
   route {
     cidr_block     = "0.0.0.0/0"
@@ -118,7 +93,7 @@ resource "aws_route_table_association" "private" {
 # Security Groups
 resource "aws_security_group" "alb" {
   name_prefix = "devops-alb-"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = data.aws_vpc.main.id
   
   ingress {
     from_port   = 80
@@ -148,7 +123,7 @@ resource "aws_security_group" "alb" {
 
 resource "aws_security_group" "ecs_tasks" {
   name_prefix = "devops-ecs-tasks-"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = data.aws_vpc.main.id
   
   ingress {
     from_port       = 3000
@@ -176,13 +151,40 @@ resource "aws_security_group" "ecs_tasks" {
   }
 }
 
+# ECR Repositories - Terraform creates these
+resource "aws_ecr_repository" "backend" {
+  name         = "devops-backend"
+  force_delete = true
+
+  lifecycle {
+    prevent_destroy = false
+  }
+
+  tags = {
+    Name = "devops-backend"
+  }
+}
+
+resource "aws_ecr_repository" "frontend" {
+  name         = "devops-frontend"
+  force_delete = true
+
+  lifecycle {
+    prevent_destroy = false
+  }
+
+  tags = {
+    Name = "devops-frontend"
+  }
+}
+
 # Application Load Balancer
 resource "aws_lb" "main" {
   name               = "devops-alb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
+  subnets            = data.aws_subnets.public.ids
   
   tags = {
     Name = "devops-alb"
@@ -194,7 +196,7 @@ resource "aws_lb_target_group" "frontend" {
   name        = "devops-frontend-tg"
   port        = 3000
   protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = data.aws_vpc.main.id
   target_type = "ip"
   
   health_check {
@@ -208,15 +210,19 @@ resource "aws_lb_target_group" "frontend" {
     timeout             = 5
     unhealthy_threshold = 2
   }
+
+  tags = {
+    Name = "devops-frontend-tg"
+  }
 }
 
 resource "aws_lb_target_group" "backend" {
   name        = "devops-backend-tg"
   port        = 8000
   protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = data.aws_vpc.main.id
   target_type = "ip"
-  
+
   health_check {
     enabled             = true
     healthy_threshold   = 2
@@ -227,6 +233,10 @@ resource "aws_lb_target_group" "backend" {
     protocol            = "HTTP"
     timeout             = 5
     unhealthy_threshold = 2
+  }
+
+  tags = {
+    Name = "devops-backend-tg"
   }
 }
 
@@ -266,161 +276,35 @@ resource "aws_ecs_cluster" "main" {
     name  = "containerInsights"
     value = "enabled"
   }
-}
 
-# ECS Task Definitions
-resource "aws_ecs_task_definition" "backend" {
-  family                   = "devops-backend"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"
-  memory                   = "512"
-  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
-  task_role_arn           = aws_iam_role.ecs_task_role.arn
-  
-  container_definitions = jsonencode([
-    {
-      name  = "backend"
-      image = "${aws_ecr_repository.backend.repository_url}:latest"
-      
-      portMappings = [
-        {
-          containerPort = 8000
-          protocol      = "tcp"
-        }
-      ]
-      
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.backend.name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
-      
-      essential = true
-    }
-  ])
-}
-
-resource "aws_ecs_task_definition" "frontend" {
-  family                   = "devops-frontend"
-  network_mode             = "awsvpc"
-  requires_compatibilities = ["FARGATE"]
-  cpu                      = "256"
-  memory                   = "512"
-  execution_role_arn       = aws_iam_role.ecs_execution_role.arn
-  task_role_arn           = aws_iam_role.ecs_task_role.arn
-  
-  container_definitions = jsonencode([
-    {
-      name  = "frontend"
-      image = "${aws_ecr_repository.frontend.repository_url}:latest"
-      
-      environment = [
-        {
-          name  = "NEXT_PUBLIC_API_URL"
-          value = "http://${aws_lb.main.dns_name}"
-        }
-      ]
-      
-      portMappings = [
-        {
-          containerPort = 3000
-          protocol      = "tcp"
-        }
-      ]
-      
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.frontend.name
-          "awslogs-region"        = var.aws_region
-          "awslogs-stream-prefix" = "ecs"
-        }
-      }
-      
-      essential = true
-    }
-  ])
-}
-
-# ECS Services
-resource "aws_ecs_service" "backend" {
-  name            = "devops-backend"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.backend.arn
-  desired_count   = 2
-  launch_type     = "FARGATE"
-  
-  network_configuration {
-    subnets          = aws_subnet.private[*].id
-    security_groups  = [aws_security_group.ecs_tasks.id]
-    assign_public_ip = false
+  tags = {
+    Name = "devops-cluster"
   }
-  
-  load_balancer {
-    target_group_arn = aws_lb_target_group.backend.arn
-    container_name   = "backend"
-    container_port   = 8000
-  }
-  
-  depends_on = [
-    aws_lb_listener.main
-  ]
-}
-
-resource "aws_ecs_service" "frontend" {
-  name            = "devops-frontend"
-  cluster         = aws_ecs_cluster.main.id
-  task_definition = aws_ecs_task_definition.frontend.arn
-  desired_count   = 2
-  launch_type     = "FARGATE"
-  
-  network_configuration {
-    subnets          = aws_subnet.private[*].id
-    security_groups  = [aws_security_group.ecs_tasks.id]
-    assign_public_ip = false
-  }
-  
-  load_balancer {
-    target_group_arn = aws_lb_target_group.frontend.arn
-    container_name   = "frontend"
-    container_port   = 3000
-  }
-  
-  depends_on = [
-    aws_lb_listener.main
-  ]
-}
-
-# ECR Repositories
-resource "aws_ecr_repository" "backend" {
-  name         = "devops-backend"
-  force_delete = true
-}
-
-resource "aws_ecr_repository" "frontend" {
-  name         = "devops-frontend"
-  force_delete = true
 }
 
 # CloudWatch Log Groups
 resource "aws_cloudwatch_log_group" "backend" {
   name              = "/ecs/devops-backend"
   retention_in_days = 7
+
+  tags = {
+    Name = "devops-backend-logs"
+  }
 }
 
 resource "aws_cloudwatch_log_group" "frontend" {
   name              = "/ecs/devops-frontend"
   retention_in_days = 7
+
+  tags = {
+    Name = "devops-frontend-logs"
+  }
 }
 
 # IAM Roles
 resource "aws_iam_role" "ecs_execution_role" {
   name = "devops-ecs-execution-role"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -433,6 +317,10 @@ resource "aws_iam_role" "ecs_execution_role" {
       }
     ]
   })
+
+  tags = {
+    Name = "devops-ecs-execution-role"
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
@@ -442,7 +330,7 @@ resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
 
 resource "aws_iam_role" "ecs_task_role" {
   name = "devops-ecs-task-role"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -455,12 +343,16 @@ resource "aws_iam_role" "ecs_task_role" {
       }
     ]
   })
+
+  tags = {
+    Name = "devops-ecs-task-role"
+  }
 }
 
 resource "aws_iam_role_policy" "ecs_task_policy" {
   name = "devops-ecs-task-policy"
   role = aws_iam_role.ecs_task_role.id
-  
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -469,7 +361,7 @@ resource "aws_iam_role_policy" "ecs_task_policy" {
         Action = [
           "secretsmanager:GetSecretValue"
         ]
-        Resource = "${aws_secretsmanager_secret.app_secrets.arn}"
+        Resource = aws_secretsmanager_secret.app_secrets.arn
       }
     ]
   })
@@ -477,18 +369,17 @@ resource "aws_iam_role_policy" "ecs_task_policy" {
 
 # Secrets Manager
 resource "aws_secretsmanager_secret" "app_secrets" {
-  name = "devops/app-secrets"
+  name = "devops/app-secrets-v4"
+
+  tags = {
+    Name = "devops-app-secrets-v4"
+  }
 }
 
 resource "aws_secretsmanager_secret_version" "app_secrets" {
   secret_id = aws_secretsmanager_secret.app_secrets.id
   secret_string = jsonencode({
     database_url = "your-database-connection-string"
-    api_key     = "your-api-key"
+    api_key      = "your-api-key"
   })
-}
-
-# Data Sources
-data "aws_availability_zones" "available" {
-  state = "available"
 }

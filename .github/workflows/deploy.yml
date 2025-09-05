@@ -28,11 +28,10 @@ jobs:
       run: |
         cd backend
         pip install -r requirements.txt
-    
+
     - name: Run backend tests
       run: |
-        cd backend
-        pytest
+        PYTHONPATH=backend pytest backend/tests/test_main.py
     
     - name: Set up Node.js
       uses: actions/setup-node@v4
@@ -54,22 +53,22 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
-    
+
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
-    
+
     - name: Build, tag, and push backend image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
@@ -80,13 +79,16 @@ jobs:
         docker build -t $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:latest .
         docker push $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG
         docker push $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:latest
-    
+
     - name: Build, tag, and push frontend image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         IMAGE_TAG: ${{ github.sha }}
+        LOAD_BALANCER_DNS: ${{ vars.LOAD_BALANCER_DNS }}
       run: |
         cd frontend
+        # Create build-time environment file
+        echo "NEXT_PUBLIC_API_URL=http://${LOAD_BALANCER_DNS}" > .env.production
         docker build -t $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG .
         docker build -t $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:latest .
         docker push $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG
@@ -96,39 +98,202 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: 1.5.0
-    
-    - name: Terraform Init
+
+    - name: Check if ECS services exist and create/update them
+      env:
+        IMAGE_TAG: ${{ github.sha }}
       run: |
-        cd terraform
-        terraform init
-    
-    - name: Terraform Plan
+        # Get ECR registry URL
+        ECR_REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+        
+        # Get Load Balancer DNS for frontend environment
+        LOAD_BALANCER_DNS=$(aws elbv2 describe-load-balancers --names devops-alb --query 'LoadBalancers[0].DNSName' --output text)
+        
+        # Function to create or update ECS service
+        create_or_update_service() {
+          local service_name=$1
+          local image_url=$2
+          local port=$3
+          local target_group_arn=$4
+          local container_name=$5
+          local task_definition_family=$6
+          
+          # Check if service exists
+          if aws ecs describe-services --cluster devops-cluster --services $service_name --query 'services[0].serviceName' --output text 2>/dev/null | grep -q $service_name; then
+            echo "Service $service_name exists, updating..."
+            
+            # Register new task definition
+            if [ "$service_name" = "devops-frontend" ]; then
+              # Frontend with environment variable
+              aws ecs register-task-definition \
+                --family $task_definition_family \
+                --network-mode awsvpc \
+                --requires-compatibilities FARGATE \
+                --cpu 256 \
+                --memory 512 \
+                --execution-role-arn $(aws iam get-role --role-name devops-ecs-execution-role --query 'Role.Arn' --output text) \
+                --task-role-arn $(aws iam get-role --role-name devops-ecs-task-role --query 'Role.Arn' --output text) \
+                --container-definitions "[{
+                  \"name\": \"$container_name\",
+                  \"image\": \"$image_url:latest\",
+                  \"environment\": [{\"name\": \"NEXT_PUBLIC_API_URL\", \"value\": \"http://$LOAD_BALANCER_DNS\"}],
+                  \"portMappings\": [{\"containerPort\": $port, \"protocol\": \"tcp\"}],
+                  \"logConfiguration\": {
+                    \"logDriver\": \"awslogs\",
+                    \"options\": {
+                      \"awslogs-group\": \"/ecs/$task_definition_family\",
+                      \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                      \"awslogs-stream-prefix\": \"ecs\"
+                    }
+                  },
+                  \"essential\": true
+                }]"
+            else
+              # Backend without environment variable
+              aws ecs register-task-definition \
+                --family $task_definition_family \
+                --network-mode awsvpc \
+                --requires-compatibilities FARGATE \
+                --cpu 256 \
+                --memory 512 \
+                --execution-role-arn $(aws iam get-role --role-name devops-ecs-execution-role --query 'Role.Arn' --output text) \
+                --task-role-arn $(aws iam get-role --role-name devops-ecs-task-role --query 'Role.Arn' --output text) \
+                --container-definitions "[{
+                  \"name\": \"$container_name\",
+                  \"image\": \"$image_url:latest\",
+                  \"portMappings\": [{\"containerPort\": $port, \"protocol\": \"tcp\"}],
+                  \"logConfiguration\": {
+                    \"logDriver\": \"awslogs\",
+                    \"options\": {
+                      \"awslogs-group\": \"/ecs/$task_definition_family\",
+                      \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                      \"awslogs-stream-prefix\": \"ecs\"
+                    }
+                  },
+                  \"essential\": true
+                }]"
+            fi
+            
+            # Update service
+            aws ecs update-service \
+              --cluster devops-cluster \
+              --service $service_name \
+              --task-definition $task_definition_family \
+              --force-new-deployment
+              
+          else
+            echo "Service $service_name does not exist, creating..."
+            
+            # Register new task definition
+            if [ "$service_name" = "devops-frontend" ]; then
+              # Frontend with environment variable
+              aws ecs register-task-definition \
+                --family $task_definition_family \
+                --network-mode awsvpc \
+                --requires-compatibilities FARGATE \
+                --cpu 256 \
+                --memory 512 \
+                --execution-role-arn $(aws iam get-role --role-name devops-ecs-execution-role --query 'Role.Arn' --output text) \
+                --task-role-arn $(aws iam get-role --role-name devops-ecs-task-role --query 'Role.Arn' --output text) \
+                --container-definitions "[{
+                  \"name\": \"$container_name\",
+                  \"image\": \"$image_url:latest\",
+                  \"environment\": [{\"name\": \"NEXT_PUBLIC_API_URL\", \"value\": \"http://$LOAD_BALANCER_DNS\"}],
+                  \"portMappings\": [{\"containerPort\": $port, \"protocol\": \"tcp\"}],
+                  \"logConfiguration\": {
+                    \"logDriver\": \"awslogs\",
+                    \"options\": {
+                      \"awslogs-group\": \"/ecs/$task_definition_family\",
+                      \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                      \"awslogs-stream-prefix\": \"ecs\"
+                    }
+                  },
+                  \"essential\": true
+                }]"
+            else
+              # Backend without environment variable
+              aws ecs register-task-definition \
+                --family $task_definition_family \
+                --network-mode awsvpc \
+                --requires-compatibilities FARGATE \
+                --cpu 256 \
+                --memory 512 \
+                --execution-role-arn $(aws iam get-role --role-name devops-ecs-execution-role --query 'Role.Arn' --output text) \
+                --task-role-arn $(aws iam get-role --role-name devops-ecs-task-role --query 'Role.Arn' --output text) \
+                --container-definitions "[{
+                  \"name\": \"$container_name\",
+                  \"image\": \"$image_url:latest\",
+                  \"portMappings\": [{\"containerPort\": $port, \"protocol\": \"tcp\"}],
+                  \"logConfiguration\": {
+                    \"logDriver\": \"awslogs\",
+                    \"options\": {
+                      \"awslogs-group\": \"/ecs/$task_definition_family\",
+                      \"awslogs-region\": \"${{ env.AWS_REGION }}\",
+                      \"awslogs-stream-prefix\": \"ecs\"
+                    }
+                  },
+                  \"essential\": true
+                }]"
+            fi
+            
+            # Get private subnet IDs
+            PRIVATE_SUBNETS=$(aws ec2 describe-subnets \
+              --filters "Name=tag:Name,Values=devops-private-subnet-*" \
+              --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+            
+            # Get security group ID
+            SECURITY_GROUP=$(aws ec2 describe-security-groups \
+              --filters "Name=tag:Name,Values=devops-ecs-tasks-sg" \
+              --query 'SecurityGroups[0].GroupId' --output text)
+            
+            # Create service
+            aws ecs create-service \
+              --cluster devops-cluster \
+              --service-name $service_name \
+              --task-definition $task_definition_family \
+              --desired-count 2 \
+              --launch-type FARGATE \
+              --network-configuration "awsvpcConfiguration={subnets=[$PRIVATE_SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}" \
+              --load-balancers "targetGroupArn=$target_group_arn,containerName=$container_name,containerPort=$port"
+          fi
+        }
+        
+        # Get target group ARNs
+        FRONTEND_TG_ARN=$(aws elbv2 describe-target-groups --names devops-frontend-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+        BACKEND_TG_ARN=$(aws elbv2 describe-target-groups --names devops-backend-tg --query 'TargetGroups[0].TargetGroupArn' --output text)
+        
+        # Create or update services
+        create_or_update_service "devops-backend" "$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY" 8000 "$BACKEND_TG_ARN" "backend" "devops-backend"
+        create_or_update_service "devops-frontend" "$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY" 3000 "$FRONTEND_TG_ARN" "frontend" "devops-frontend"
+        
+        echo "Deployment completed successfully!"
+
+    - name: Wait for deployment to complete
       run: |
-        cd terraform
-        terraform plan
-    
-    - name: Terraform Apply
+        echo "Waiting for services to reach stable state..."
+        aws ecs wait services-stable --cluster devops-cluster --services devops-backend devops-frontend
+        echo "Services are now stable!"
+
+    - name: Display service status
       run: |
-        cd terraform
-        terraform apply -auto-approve
-    
-    - name: Update ECS Services
-      run: |
-        aws ecs update-service --cluster devops-cluster --service devops-backend --force-new-deployment
-        aws ecs update-service --cluster devops-cluster --service devops-frontend --force-new-deployment
+        echo "=== Backend Service Status ==="
+        aws ecs describe-services --cluster devops-cluster --services devops-backend --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,Pending:pendingCount}'
+        
+        echo "=== Frontend Service Status ==="
+        aws ecs describe-services --cluster devops-cluster --services devops-frontend --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,Pending:pendingCount}'
+        
+        echo "=== Application URL ==="
+        LOAD_BALANCER_DNS=$(aws elbv2 describe-load-balancers --names devops-alb --query 'LoadBalancers[0].DNSName' --output text)
+        echo "Frontend: http://$LOAD_BALANCER_DNS"
+        echo "Backend Health: http://$LOAD_BALANCER_DNS/api/health"
