@@ -21,7 +21,7 @@ This project consists of a FastAPI backend and a Next.js frontend that communica
 
 - Python 3.8+
 - Node.js 16+
-- npm or yarn
+- npm start or yarn
 
 ## Backend Setup
 
